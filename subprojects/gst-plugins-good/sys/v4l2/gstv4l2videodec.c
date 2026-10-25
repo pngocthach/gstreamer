@@ -262,12 +262,10 @@ gst_v4l2_video_dec_set_format (GstVideoDecoder * decoder,
   GstV4l2VideoDec *self = GST_V4L2_VIDEO_DEC (decoder);
   GstV4l2Error error = GST_V4L2_ERROR_INIT;
   gboolean ret = TRUE;
-  gboolean dyn_resolution = self->v4l2output->fmtdesc &&
-      (self->v4l2output->fmtdesc->flags & V4L2_FMT_FLAG_DYN_RESOLUTION);
 
   GST_DEBUG_OBJECT (self, "Setting format: %" GST_PTR_FORMAT, state->caps);
 
-  if (self->input_state && !dyn_resolution) {
+  if (self->input_state) {
     if (compatible_caps (self, state->caps)) {
       GST_DEBUG_OBJECT (self, "Compatible caps");
       goto done;
@@ -305,9 +303,7 @@ gst_v4l2_video_dec_set_format (GstVideoDecoder * decoder,
     self->output_flow = GST_FLOW_OK;
   }
 
-  /* No V4L2_FMT_FLAG_DYN_RESOLUTION or no fmtdesc set yet */
-  if (!dyn_resolution)
-    ret = gst_v4l2_object_set_format (self->v4l2output, state->caps, &error);
+  ret = gst_v4l2_object_set_format (self->v4l2output, state->caps, &error);
 
   if (ret)
     self->input_state = gst_video_codec_state_ref (state);
@@ -694,12 +690,17 @@ gst_v4l2_video_dec_wait_for_src_ch (GstV4l2VideoDec * self)
 
   GST_DEBUG_OBJECT (self, "Waiting for source change event");
 
+  /* CAPTURE has no streaming buffers yet. Only poll for priority events:
+   * polling for readable buffers can report POLLERR before SOURCE_CHANGE. */
+  gst_poll_fd_ctl_read (self->v4l2capture->poll,
+      &self->v4l2capture->pollfd, FALSE);
   GST_VIDEO_DECODER_STREAM_UNLOCK (GST_VIDEO_DECODER (self));
   flowret = gst_v4l2_object_poll (self->v4l2capture, GST_CLOCK_TIME_NONE);
+  gst_poll_fd_ctl_read (self->v4l2capture->poll,
+      &self->v4l2capture->pollfd, TRUE);
   GST_VIDEO_DECODER_STREAM_LOCK (GST_VIDEO_DECODER (self));
 
-  /* Fix the flow return value, as the poll is watching for buffer, but we are
-   * looking for the source change event */
+  /* Map the initial source-change event to successful negotiation. */
   if (flowret == GST_V4L2_FLOW_RESOLUTION_CHANGE) {
     self->wait_for_source_change = FALSE;
     flowret = GST_FLOW_OK;

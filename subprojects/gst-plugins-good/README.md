@@ -1,5 +1,123 @@
 GStreamer 1.24.x stable series
 
+Local Armbian V4L2 integration
+-----------------------------
+
+This fork carries two fixes to the GStreamer 1.24.2 V4L2 stateful decoder
+tested with the Meson VDEC driver on an Amlogic S905W Armbian TV box.
+
+The startup fix is in `gst_v4l2_video_dec_wait_for_src_ch()`. Before the
+CAPTURE queue has streaming buffers, it temporarily polls only priority events
+and restores normal buffer-read polling afterward. The Meson driver can report
+`POLLERR` for readable-buffer polling during this valid startup gap; treating
+that as a fatal decoder failure prevents playback. This fix does not sleep,
+retry, suppress errors, or change the kernel.
+
+The rotation fix is in `gst_v4l2_video_dec_set_format()`. In upstream 1.24.2,
+`V4L2_FMT_FLAG_DYN_RESOLUTION` bypasses the usual incompatible-caps teardown
+and skips setting the V4L2 OUTPUT format. With the Meson decoder, an iPhone
+orientation change updates the H.264 SPS and emits `SOURCE_CHANGE`, but leaving
+the old OUTPUT/capture configuration in place stalls decoded output. The fix
+runs the normal caps-compatibility check, drains/stops the queues when caps
+change, and applies the new OUTPUT format even for a dynamic-resolution
+format. Framerate-only caps changes remain compatible.
+
+`uxplay-kms-launch.c` is the board-specific display helper. It discovers the
+active HDMI CRTC, primary and NV12 overlay planes, disables the opaque console
+primary plane, and execs UxPlay with a DRM master descriptor inherited by
+`kmssink`. This gives V4L2 decoder DMA-BUFs a direct NV12 scanout path. It is
+not a generic GStreamer component.
+
+## Rebuild and install
+
+Tested versions: GStreamer 1.24.2 (source revision
+`2d8273151571fcab887cc81de48e87aeb61b5c06`), UxPlay 1.73.7, and kernel
+`6.12.44-ophub`. The board needs the matching GStreamer core/video development
+files, Meson, Ninja, libdrm, and libgudev development files.
+
+Clone this fork and build only `gst-plugins-good` with the isolated prefix:
+
+```sh
+git clone https://github.com/pngocthach/gstreamer.git
+cd gstreamer
+git switch armbian-v4l2-dyn-resolution
+cd subprojects/gst-plugins-good
+meson setup build \
+  --prefix=/opt/uxplay-gst-v4l2 \
+  --buildtype=release \
+  --auto-features=disabled \
+  -Dv4l2=enabled \
+  -Dv4l2-gudev=enabled \
+  -Dv4l2-probe=true
+ninja -C build -j2
+ninja -C build install
+```
+
+Build the KMS helper from the same checkout:
+
+```sh
+cc -std=c11 -O2 -Wall -Wextra -Werror -I/usr/include/libdrm \
+  uxplay-kms-launch.c -ldrm -o /usr/local/bin/uxplay-kms-launch
+```
+
+The user service must set `GST_PLUGIN_PATH_1_0` to
+`/opt/uxplay-gst-v4l2/lib/gstreamer-1.0` and use a private
+`GST_REGISTRY_1_0` cache. Verify that `gst-inspect-1.0 v4l2h264dec` reports
+the plugin filename under that prefix. Keep the distro plugin untouched.
+
+The tested UxPlay video configuration is:
+
+```sh
+/usr/local/bin/uxplay-kms-launch /usr/local/bin/uxplay \
+  -n Armbian-TV-UxPlay -srgb no -bt709 -vd v4l2h264dec \
+  -vc "video/x-raw,format=NV12"
+```
+
+The launcher supplies `kmssink` and its DRM descriptor. This selects V4L2
+hardware decode with no software fallback and NV12 direct scanout. Leave
+UxPlay's default timestamp synchronization enabled; `-vsync no` was tried but
+caused audible/video desynchronization. The direct caps path is simpler than
+`videoconvert ! video/x-raw,format=NV12`; short live samples measured about
+22.9 scanouts/s with the converter at 500x1080 and 22.7/s direct at 1920x888.
+Since those resolutions differ, they do not establish a speedup or slowdown.
+The direct caps path remains the selected NV12-native configuration.
+
+## Verification and observed results
+
+The original startup failure was `poll error` with the stock plugin. With the
+startup polling fix, 30 independent VPU starts decoded 1,800 frames across
+1280x720 and 500x1080 fixtures; first-frame luma hashes matched the software
+reference. Direct NV12 HDMI scanout completed 60/60 frames, with decoder
+DMA-BUF imports visible in DRM state.
+
+For the rotation regression, capture a private H.264 sample from the iPhone,
+including portrait and landscape SPS changes. Replay through `h264parse !`
+`v4l2h264dec` while observing negotiated caps and output buffers. The old 1.24.2
+path stopped after its first resolution change; the patched decoder continued
+through repeated 500x1080 / 1920x888 changes on the VPU. The concatenated
+capture loop has boundary warnings, so use it as a dynamic-caps regression
+check, not as a fidelity or end-to-end frame-rate benchmark. On the actual
+receiver, the user confirmed that repeated iPhone rotations no longer froze
+the picture.
+
+Live DRM framebuffer sampling measured roughly 22–23 scanouts per second.
+Before verbose diagnostics were disabled, decoder logs showed about 30 input
+frames/s and recurring QoS late-frame drops. Whole-system samples during
+mirroring showed 84–97% CPU idle, about 1.2 GiB RAM available, no I/O wait,
+and 56°C, so host-wide CPU, memory, thermal, and storage pressure was not the
+cause. Turning off timestamp sync caused audio/video drift and was reverted.
+
+For a fresh hardware check, reconnect the iPhone, play moving content, confirm
+`/sys/kernel/debug/dri/0/state` shows the NV12 overlay plane with a changing
+framebuffer ID, and rotate between portrait and landscape several times.
+Use targeted GStreamer warnings for diagnosis; avoid per-frame `kmssink:6`
+logging and `-vdmp` capture in normal operation.
+
+To roll back, restore the saved service override and rebuild the unmodified
+1.24.2 plugin into the same isolated prefix. Do not overwrite or remove the
+distro GStreamer plugin; the service's private plugin path makes rollback
+independent of system packages.
+
 WHAT IT IS
 ----------
 
